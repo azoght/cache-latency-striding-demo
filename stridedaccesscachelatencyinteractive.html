@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cache Latency vs. Stride & Block Size (Interactive)</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 20px; margin: 0 0 10px; }
+    p.note { color: #555; font-size: 13px; line-height: 1.35; }
+    .controls { display: grid; grid-template-columns: repeat(2, minmax(260px,1fr)); gap: 12px; margin: 10px 0 6px; }
+    .control { background: #f7f7f9; border: 1px solid #e7e7ef; border-radius: 10px; padding: 10px 12px; }
+    .control label { display:block; font-size: 12px; color:#444; margin-bottom: 6px; }
+    .control input[type=range] { width: 100%; }
+    .inline { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .value { font-weight: 600; font-variant-numeric: tabular-nums; }
+    #chart { width: 100%; height: 600px; }
+    .footer { font-size: 12px; color:#666; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Conceptual Cache Latency vs. Stride and Block Size</h1>
+    <p class="note">
+      Interactive 3D surface showing an <b>illustrative</b> (not measured) average-latency model as a function of
+      <b>stride</b> (bytes) and <b>block size</b> (cache line size, bytes). Use the sliders to change the number of <b>sets</b>
+      and <b>associativity</b> (ways). Spikes appear when <code>(stride / block) mod sets ≈ 0</code>, causing repeated
+      mapping to the same set (conflict thrash). Higher associativity reduces spike amplitude.
+    </p>
+
+    <div class="controls">
+      <div class="control">
+        <div class="inline">
+          <label for="sets">Number of sets</label>
+          <div class="value"><span id="setsVal">16</span></div>
+        </div>
+        <input id="sets" type="range" min="4" max="128" step="1" value="16" />
+        <small>Tip: powers of two are most realistic (e.g., 8, 16, 32, 64).</small>
+      </div>
+
+      <div class="control">
+        <div class="inline">
+          <label for="assoc">Associativity (ways)</label>
+          <div class="value"><span id="assocVal">4</span></div>
+        </div>
+        <input id="assoc" type="range" min="1" max="16" step="1" value="4" />
+        <small>Higher associativity generally reduces conflict thrash.</small>
+      </div>
+    </div>
+
+    <div id="chart"></div>
+    <div class="footer">
+      Model parameters: stride ∈ [1, 4096] bytes; block size ∈ [16, 256] bytes. Latency is capped at a conceptual memory ceiling.
+    </div>
+  </div>
+
+  <script>
+    // Grid parameters
+    const strideMin = 1, strideMax = 4096, strideSteps = 200;
+    const blockMin = 16, blockMax = 256, blockSteps = 60;
+
+    // Generate axes
+    function linspace(a, b, n) { const arr = []; const step = (b - a) / (n - 1); for (let i=0;i<n;i++) arr.push(a + i*step); return arr; }
+    const strides = linspace(strideMin, strideMax, strideSteps);
+    const blocks  = linspace(blockMin, blockMax, blockSteps);
+
+    // Base latency model
+    function baseLatency(stride, block) { // piecewise
+      const r = stride / block;
+      if (stride < block) {
+        return 4 + 8*Math.pow(r, 0.8); // ~L1-ish zone improving as stride shrinks
+      } else {
+        return 50 + 10*Math.log2(r + 1); // ~miss per access, gradually rising
+      }
+    }
+
+    // Compute Z surface for given sets (S) and associativity (A)
+    function computeSurface(S, A) {
+      const Z = [];
+      const width = 0.12;                       // spike width in "lines"
+      const baseSpikeAmp = 40;                  // base amplitude for spikes
+      const spikeAmp = baseSpikeAmp / Math.max(1, A); // scale by associativity (more ways -> smaller spikes)
+      const ceiling = 220;
+
+      for (let bi = 0; bi < blocks.length; bi++) {
+        const b = blocks[bi];
+        const row = [];
+        for (let si = 0; si < strides.length; si++) {
+          const s = strides[si];
+          let lat = baseLatency(s, b);
+
+          // conflict spikes: at multiples of S in units of lines (t = s / b)
+          const t = s / b;
+          const maxM = Math.ceil((strides[strides.length-1]/b) / S);
+          let spike = 0.0;
+          for (let m = 1; m <= maxM; m++) {
+            const center = m * S;
+            const x = (t - center) / width;
+            spike += spikeAmp * Math.exp(-x*x);
+          }
+
+          row.push(Math.min(lat + spike, ceiling));
+        }
+        Z.push(row);
+      }
+      return Z;
+    }
+
+    // Initial values
+    let S = 16, A = 4;
+    const Z0 = computeSurface(S, A);
+
+    // Build Plotly surface
+    const data = [{
+      type: 'surface',
+      x: strides, y: blocks, z: Z0,
+      contours: { z: { show: false } },
+      showscale: true
+    }];
+
+    const layout = { 
+      title: 'Conceptual Average Latency (cycles; illustrative)',
+      scene: { 
+        xaxis: { title: 'Stride (bytes)' },
+        yaxis: { title: 'Block size (bytes)' },
+        zaxis: { title: 'Average latency (cycles)' }
+      }};
+
+    Plotly.newPlot('chart', data, layout, {responsive: true});
+
+    // Hook up sliders
+    const setsEl = document.getElementById('sets');
+    const assocEl = document.getElementById('assoc');
+    const setsVal = document.getElementById('setsVal');
+    const assocVal = document.getElementById('assocVal');
+
+    function update() {
+      S = parseInt(setsEl.value, 10);
+      A = parseInt(assocEl.value, 10);
+      setsVal.textContent = S;
+      assocVal.textContent = A;
+
+      const Z = computeSurface(S, A);
+      Plotly.update('chart', { z: [Z] }, {});
+    }
+
+    setsEl.addEventListener('input', update);
+    assocEl.addEventListener('input', update);
+  </script>
+</body>
+</html>
